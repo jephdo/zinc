@@ -27,6 +27,8 @@ Authors: Joshua Levy, Srinath Sridhar, Kazuyuki Tanimura, Nishant Deshpande
 #
 # Revision history:
 #
+# 0.3.31  Add option for zinc update to use local change to override remote changes
+# 0.3.30  Add support for IAM role account. remove exit when missing AWS credentials
 # 0.3.29  Add zinc diff command.
 # 0.3.28  Fix: wildcard matching bug
 # 0.3.27  Zinc locate multiple files with --recursive
@@ -56,15 +58,29 @@ Authors: Joshua Levy, Srinath Sridhar, Kazuyuki Tanimura, Nishant Deshpande
 #
 
 from __future__ import with_statement
-import sys, re, os, subprocess, shutil, hashlib, binascii, random, time, logging, optparse, functools, ConfigParser, calendar, cStringIO, errno, httplib, rfc822
+import sys, re, os, subprocess, shutil, hashlib, binascii, random, time, logging, optparse, functools, calendar, errno
+import email.utils
 from datetime import datetime
 from contextlib import contextmanager
+
+IS_PYTHON2 = sys.version_info[0] == 2
+
+if IS_PYTHON2:
+  from cStringIO import StringIO
+  import Queue
+  import ConfigParser
+  import httplib
+else:
+  from io import StringIO
+  import queue as Queue
+  import configparser  as ConfigParser
+  import http.client as httplib
 
 import boto
 from boto.s3.connection import S3Connection # XXX seems to be needed to initialize boto module correctly
 
 # Version of this code.
-ZINC_VERSION = "0.3.29"
+ZINC_VERSION = "0.3.30"
 # Version of this repository implementation.
 REPO_VERSION = "0.3"
 REPO_VERSIONS_SUPPORTED = ["0.2", "0.3"]
@@ -219,7 +235,7 @@ class _Enum(object):
 
   @classmethod
   def values(cls):
-    return cls.value_dict.keys()
+    return list(cls.value_dict.keys())
 
 def enum(name, **enum_dict):
   '''
@@ -230,7 +246,7 @@ def enum(name, **enum_dict):
   '''
   new_type = type(name, (_Enum,), enum_dict)
   new_type.key_dict = enum_dict
-  new_type.value_dict = dict((v, k) for (k, v) in enum_dict.iteritems())
+  new_type.value_dict = dict((v, k) for (k, v) in enum_dict.items())
   return new_type
 
 def fail(message=None, prefix="error", exc_info=None, status=1, suppress=False):
@@ -328,7 +344,7 @@ def group_pairs(pairs):
 
 def setattrs(self, others):
   ''' useful for saving others (function properties) as instance variables '''
-  for (k, v) in others.iteritems():
+  for (k, v) in others.items():
     setattr(self, k, v)
 
 
@@ -423,7 +439,7 @@ def temp_output_file(prefix=None, based_on=None, with_nonce=True):
   yield tmp_path
   try:
     os.remove(tmp_path)
-  except OSError, e:
+  except OSError as e:
     pass
 
 @log_calls
@@ -522,7 +538,7 @@ def temp_output_dir(output_dir, temp_dir=None, backup_suffix=None):
       for dir in list_dirs_recursive(temp_dir):
         os.rmdir(join_path(temp_dir, dir))
       os.rmdir(temp_dir)
-    except Exception, e:
+    except Exception as e:
       log.warn("error cleaning up temporary directory: %s: %s", temp_dir, e)
 
 def shell_command(command, wait=True):
@@ -537,9 +553,9 @@ def shell_command(command, wait=True):
       p.wait()
     else:
       return p
-  except subprocess.CalledProcessError, e:
+  except subprocess.CalledProcessError as e:
     raise ShellError("shell command '%s' returned status %s" % (" ".join(command), e.returncode))
-  except OSError, e:
+  except OSError as e:
     raise ShellError("shell command '%s' failed: %s" % (" ".join(command), e))
 
 def expand_wildcards(wildcards, candidates, recursive=False):
@@ -685,7 +701,7 @@ def parse_datetime(datetime_str, formats=DATETIME_FORMATS, tz_offset=None, assum
       continue
     break
   else:
-    raise InvalidArgument("could not parse date: '%s'" % datetime_str) 
+    raise InvalidArgument("could not parse date: '%s'" % datetime_str)
   return seconds
 
 _DATESPEC_RE1 = re.compile("([<>])\s*{(.*)}")
@@ -698,7 +714,7 @@ def parse_datespec(datespec_str, assume_utc=False):
   Parse a date spec and return a filter function that returns true if the
   supplied time satisfies the date spec.
 
-  Formats: 
+  Formats:
   < [date expression]
   > [date expression]
   [date expression] to [date expression]
@@ -706,7 +722,7 @@ def parse_datespec(datespec_str, assume_utc=False):
   datespec_str = datespec_str.strip()
   m = None
   if not m:
-    m = _DATESPEC_RE1.match(datespec_str) or _DATESPEC_RE1A.match(datespec_str) 
+    m = _DATESPEC_RE1.match(datespec_str) or _DATESPEC_RE1A.match(datespec_str)
     if m:
       direction = m.group(1)
       time = parse_datetime(m.group(2), assume_utc=assume_utc)
@@ -758,7 +774,7 @@ class Values(object):
   where values are potentially longer multi-line strings.
   '''
 
-  # A magic char sequence to indicate start of a new record 
+  # A magic char sequence to indicate start of a new record
   RECORD_MAGIC = "%%>>"
   VERSION = "znval 1.0"
 
@@ -931,7 +947,7 @@ class Config(object):
       keys = config.get("default", "access_key"), config.get("default", "secret_key")
       log.debug("read S3 keys from $HOME/.s3cfg file")
       return keys
-    except Exception, e:
+    except Exception as e:
       log.info("could not read S3 keys from $HOME/.s3cfg file; skipping (%s)", e)
       return None
 
@@ -982,7 +998,7 @@ class Fingerprint(object):
     fp = Fingerprint()
     fp.read_from_file(local_path, md5=md5, compute_md5=compute_md5, state=state)
     return fp
-    
+
   def read_from_file(self, path, md5=None, compute_md5=False, state=FileState.Tracked):
     if not os.path.isfile(path):
       raise InvalidOperation("file not found: '%s'" % path)
@@ -1022,7 +1038,7 @@ class Fingerprint(object):
 
   def from_str(self, vals_str):
     vals = shortvals_from_str(vals_str)
-    for (k, v) in vals.iteritems():
+    for (k, v) in vals.items():
       if k == "mtime":
         v = float(v)
       if k == "size":
@@ -1122,7 +1138,8 @@ class Store(object):
     (prefix, path) = split_uri(root_uri)
     for subclass in Store.__subclasses__():
       if subclass.prefix == prefix:
-        return super(cls, subclass).__new__(subclass, root_uri, config, file_cache=file_cache)
+        return super(Store, cls).__new__(subclass)
+        # return subclass(root_uri, config, file_cache=file_cache)
     raise InvalidArgument("unsupported store type: %s" % prefix)
 
   def __init__(self, root_uri, config, file_cache=None):
@@ -1145,7 +1162,7 @@ class Store(object):
     with open(temp_filename, "rb") as fp:
       value = fp.read()
     os.remove(temp_filename)
-    return value
+    return value.decode()
 
   def write_string(self, store_path, value, clobber=False):
     temp_filename = new_temp_filename("write_string")
@@ -1284,7 +1301,7 @@ class FileStore(Store):
     # XXX For better performance, could copy and compute hash at same time
     copyfile_atomic(self._full_path(store_path), local_path, make_parents=True, backup_suffix=backup_suffix)
     return Fingerprint.of_file(local_path, compute_md5=True)
-    
+
   def upload(self, local_path, store_path, clobber=False, show_info=False):
     self._log_upload(local_path, store_path, show_info=show_info)
     target = self._full_path(store_path)
@@ -1300,10 +1317,10 @@ class S3Store(Store):
   prefix = "s3"
   retries = Config.s3store_copyfile_retries()
   def __init__(self, root_uri, config, file_cache=None):
-    if not config.s3_access_key or not config.s3_secret_key:
-      raise Failure("missing S3 access keys: set %s/%s environment variables or add s3_access_key/s3_secret_key to your config" %
-        (S3_ACCESS_KEY_NAME, S3_SECRET_KEY_NAME))
-    self.connection = boto.s3.connection.S3Connection(config.s3_access_key, config.s3_secret_key, is_secure=config.s3_ssl)
+    try:
+      self.connection = boto.s3.connection.S3Connection(config.s3_access_key, config.s3_secret_key, is_secure=config.s3_ssl)
+    except Exception as e:
+      raise Failure("Unable to connect to S3: %s. S3_ACCESS_KEY_NAME set to: %s. S3_SECRET_KEY_NAME set to: %s" % (e, config.s3_access_key, config.s3_secret_key))
     root_uri = root_uri.rstrip("/")
     Store.__init__(self, root_uri, config, file_cache=file_cache)
     elements = split_uri(root_uri)[1].split('/')
@@ -1337,7 +1354,7 @@ class S3Store(Store):
             k.get_contents_to_file(tmp_f)
           log.debug("got contents of %s to %s", key_path, tmp_f)
           break
-        except httplib.IncompleteRead, e:
+        except httplib.IncompleteRead as e:
           log.warn("[attempt %s] %s. Going to test if file is complete.", num_attempts, e)
           tmp_k = self.root_bucket.get_key(key_path)
           log.info("IncompleteRead exception handler: tmp_k = %s", tmp_k)
@@ -1350,7 +1367,7 @@ class S3Store(Store):
             if repo_md5 == md5:
               log.info("IncompleteRead exception handler: recovered from IncompleteRead - file is complete - carrying on.")
               break
-        except Exception, e:
+        except Exception as e:
           log.warn("S3 failed downloading '%s', reason: '%s', attempt number %s", source_path, e, num_attempts)
         num_attempts += 1
         if num_attempts > self.retries:
@@ -1367,10 +1384,10 @@ class S3Store(Store):
       log.debug("adding timestamp to file")
       if k.last_modified != None:
         try:
-          modified_tuple = rfc822.parsedate_tz(k.last_modified)
-          modified_stamp = int(rfc822.mktime_tz(modified_tuple))
+          modified_tuple = email.utils.parsedate_tz(k.last_modified)
+          modified_stamp = int(email.utils.mktime_tz(modified_tuple))
           os.utime(tmp_path, (modified_stamp, modified_stamp))
-        except Exception, e:
+        except Exception as e:
           log.warn("Could not set file timestamp. Ignoring. (%s)", e)
 
       # If md5 has already been calculated, no need to do it again. Just return it.
@@ -1433,12 +1450,12 @@ class S3Store(Store):
           # For now this is single threaded; concurrency could speed it up, depending on disk/network performance.
           while bytes_done < fsize:
             log.debug("uploading part %s of %s -> %s", part, local_path, remote_path)
-            mpu.upload_part_from_file(cStringIO.StringIO(f.read(S3_MULTIPART_CHUNK_SIZE)), part)
+            mpu.upload_part_from_file(StringIO(f.read(S3_MULTIPART_CHUNK_SIZE)), part)
             bytes_done += S3_MULTIPART_CHUNK_SIZE
             part += 1
         cmpu = mpu.complete_upload()
         log.debug("uploading complete %s -> %s: %s (etag %s)", local_path, remote_path, cmpu, cmpu.etag)
-      except Exception, e:
+      except Exception as e:
         mpu.cancel_upload()
         raise Failure("error uploading '%s' to S3 location '%s': %s" % (local_path, remote_path, e))
 
@@ -1542,7 +1559,7 @@ class Manifest(object):
     match_nonrec = lambda p: (p.startswith(prefix) and ('/' not in p[len(prefix):]) or p == path)
     match_func = match_rec if recursive else match_nonrec
     return [item for item in self.items if match_func(item.path)]
-    
+
   def _items_to_str(self):
     out = []
     for item in self.items:
@@ -1601,7 +1618,7 @@ class Changelist(object):
       status[p] = Changelist.Status.REMOVED
     for p in self.mod_paths:
       status[p] = Changelist.Status.MODIFIED
-    return status 
+    return status
 
   def all_paths(self):
     return self.add_paths.union(self.rm_paths).union(self.mod_paths)
@@ -1653,7 +1670,7 @@ class Changelist(object):
     uni_changeset.mod_paths |= self.rm_paths  & other_changelist.add_paths # case 5
     uni_changeset.mod_paths |= self.mod_paths | other_changelist.mod_paths # case 11, 12, 15
     return uni_changeset
-    
+
   def is_empty(self):
     return len(self.add_paths) == 0 and len(self.rm_paths) == 0 and len(self.mod_paths) == 0
 
@@ -1735,7 +1752,7 @@ def compressed_local_file(local_path, scheme):
     compress_file(local_path, compressed_path, scheme)
     yield compressed_path
     # TODO For better performance, optionally accept a FileCache and move the compressed file to the cache.
-    os.remove(compressed_path)   
+    os.remove(compressed_path)
 
 @contextmanager
 def decompressed_local_file(local_path, scheme):
@@ -1820,7 +1837,7 @@ class Repo(object):
 
   Concurrency:
   - Reads never require locks.
-  - Data integrity is maintined during interruptions. Additional spurious 
+  - Data integrity is maintined during interruptions. Additional spurious
     files may be present after an interruption, but this is harmless, as final
     writing of manifests and of new commits is atomic.
   - Atomic write operations only require a lock briefly on a single
@@ -1897,7 +1914,7 @@ class Repo(object):
       found_repo_version = version_info["repo_version"]
       if found_repo_version not in REPO_VERSIONS_SUPPORTED:
         raise InvalidArgument("this code supports repository versions %s but this repository is version %s: %s" % (REPO_VERSIONS_SUPPORTED, found_repo_version, self.store.root_uri))
-    except Exception, e:
+    except Exception as e:
       raise InvalidOperation("repository not valid at %s (expecting repo_version %s) (%s)" % (self.store.root_uri, REPO_VERSION, str(e).strip()))
     log.debug("valid repository, version %s", found_repo_version)
 
@@ -1966,7 +1983,7 @@ class Repo(object):
     tags_file = self._store_path_tags(scope)
     if not self.store.exists(tags_file):
       log.debug("get_tags: tags file not present: %s", tags_file)
-      # TODO should change so we always make empty tags file, and use this to raise exception only if invalid scope 
+      # TODO should change so we always make empty tags file, and use this to raise exception only if invalid scope
       return
 
     # Find all tags in the desired range (if supplied) that also match the filter (if supplied).
@@ -2113,7 +2130,7 @@ class Repo(object):
     if rev_start:
       try:
         rev_start_index = all_revs.index(rev_start)
-      except ValueError, e:
+      except ValueError as e:
         raise InvalidArgument("unknown revision %s for scope '%s'" % (rev_start, scope))
       # If rev_start is set and not rev_end, go backward in time ("tip:" is backwards from tip)
       if not rev_end:
@@ -2121,7 +2138,7 @@ class Repo(object):
     if rev_end:
       try:
         rev_end_index = all_revs.index(rev_end)
-      except ValueError, e:
+      except ValueError as e:
         raise InvalidArgument("unknown revision %s for scope '%s'" % (rev_end, scope))
       # If rev_end is set and not rev_start, go forward in time (":tip" is forwards from start)
       if not rev_start:
@@ -2154,7 +2171,7 @@ class Repo(object):
       stream.write(mf.to_summary())
       # TODO add tag names to log listing
       stream.write("\n")
-    
+
   @log_calls
   def tag(self, scope, tag_name, srev='tip'):
     '''
@@ -2175,7 +2192,7 @@ class Repo(object):
     assert changelist.rm_paths.issubset(all_paths)
     assert changelist.mod_paths.issubset(all_paths)
     assert len(changelist.add_paths.intersection(all_paths)) == 0
-      
+
     new_items = []
     changed_items = []
     for item in items:
@@ -2357,7 +2374,7 @@ class Repo(object):
     if type(details) == list:
       details = join_path(*details)
     return (kind, parents, details)
-      
+
 
 ##
 ## Working directory
@@ -2410,7 +2427,7 @@ class CheckoutList(object):
     return self.checkouts[scope].rev if scope in self.checkouts else None
 
   def as_list(self):
-    return sorted(list(self.checkouts.itervalues()), key=(lambda c: c.scope))
+    return sorted(list(self.checkouts.values()), key=(lambda c: c.scope))
 
   def to_str(self):
     out = []
@@ -2461,7 +2478,7 @@ class FingerprintList(object):
     '''Fill in MD5s from all matching fingerprints in another FingerprintList.'''
     count = 0
     other_fps = other_fingerprints.fingerprints
-    for (path, fp) in self.fingerprints.iteritems():
+    for (path, fp) in self.fingerprints.items():
       if path in other_fps:
         other_fp = other_fps[path]
         if other_fp.md5 and fp.compare(other_fp) == Fingerprint.SAME:
@@ -2473,7 +2490,7 @@ class FingerprintList(object):
   def compute_md5s(self, root_path):
     '''Compute MD5s for all files that are missing them.'''
     count = 0
-    for (path, fp) in self.fingerprints.iteritems():
+    for (path, fp) in self.fingerprints.items():
       if not fp.md5:
         full_path = join_path(root_path, path)
         log.debug("computing MD5 for file: %s", full_path)
@@ -2563,7 +2580,7 @@ class CheckoutState(object):
     '''Return all items within the given directory scope (or other directory prefix). Returned paths are trimmed of the scope.'''
     fingerprints = FingerprintList()
     prefix = scope.strip("/") + "/"
-    for (local_path, fp) in self.fingerprints.fingerprints.iteritems():
+    for (local_path, fp) in self.fingerprints.fingerprints.items():
       if local_path.startswith(prefix):
         if fp.state == FileState.Tracked:
           fingerprints.update_fingerprint(local_path[len(prefix):], fp)
@@ -2582,7 +2599,7 @@ class CheckoutState(object):
     self.fingerprints.update_fingerprint(local_path, fingerprint)
 
   def update_fingerprints(self, scope, fingerprints):
-    for (path, fp) in fingerprints.fingerprints.iteritems():
+    for (path, fp) in fingerprints.fingerprints.items():
       self.update_item(scope, path, fp)
 
   def update_from_changelist(self, scope, changelist, new_fingerprints):
@@ -2602,7 +2619,7 @@ class CheckoutState(object):
     self.fingerprints.fingerprints.pop(local_path)
 
   def to_str(self):
-    for (path, fp) in self.fingerprints.fingerprints.iteritems():
+    for (path, fp) in self.fingerprints.fingerprints.items():
       if not fp or not fp.md5:
         raise AssertionError("missing Fingerprint or MD5 when serializing FingerprintList: %s: %s" % (path, fp))
     return values_to_str([("checkouts", self.checkouts.to_str()),
@@ -2660,7 +2677,7 @@ def changelist_for_fingerprints(old_fingerprints, new_fingerprints, fill_md5s=Tr
   if fill_md5s:
     old_fingerprints.fill_md5s(new_fingerprints)
     new_fingerprints.fill_md5s(old_fingerprints)
-  
+
   # These are dictionaries of full path -> fingerprint
   old_dict = old_fingerprints.fingerprints
   new_dict = new_fingerprints.fingerprints
@@ -2819,7 +2836,7 @@ class WorkingDir(object):
 
   def update_scope_mode(self, scope, mode):
     self.checkout_state.scope_mode(scope, mode)
-  
+
   @log_calls
   def checkout(self, scope, srev="tip", force=False, mode=Mode.AUTO):
     '''
@@ -2850,7 +2867,7 @@ class WorkingDir(object):
     if not self.checkout_state.has_scope(scope):
       raise InvalidArgument("scope is not checked out: '%s'" % scope)
     old_fingerprints = self.checkout_state.for_subdir(scope)
-    
+
     file_list = self._walk_files(scope, force_mode=force_mode, print_untracked=print_untracked)
     local_scope_path = join_path(self.work_dir, scope)
     new_fingerprints = FingerprintList.of_files(local_scope_path, file_list, compute_md5=compute_md5)
@@ -2893,7 +2910,7 @@ class WorkingDir(object):
     return new_fingerprints
 
   @log_calls
-  def update(self, scope, srev="tip", force=False, is_checkout=False, mode=None):
+  def update(self, scope, srev="tip", force=False, is_checkout=False, mode=None, local_override=False):
     '''
     Update working directory. Checkouts are also implemented here, as if they were updates from an empty manifest.
     mode is only for checkout
@@ -2916,6 +2933,7 @@ class WorkingDir(object):
 
     # Find out what files we need to update.
     changelist = changelist_for_items(old_mf.items, new_mf.items) if not is_partial_checkout else Changelist()
+
     log.debug("update from %s to %s, changing %s", old_mf, new_mf, changelist)
 
     # If in partial tracking mode, keep only FileState.Tracked files
@@ -2932,22 +2950,49 @@ class WorkingDir(object):
     overlap_changelist = status_changelist.intersect(changelist)
     log.debug("update changelist:\n%s", changelist.to_summary())
     log.debug("status changelist:\n%s", status_changelist.to_summary())
-    if not overlap_changelist.is_empty():
-      log.error("local changes conflict with update for scope '%s':", scope)
-      log.stream.write(overlap_changelist.to_summary())
-      raise InvalidOperation("Zinc does not currently support automatic merges: must revert locally changed files, update, and then manually merge")
 
     log.info("%s: scope '%s' at revision %s (%s files total)",
              "checkout" if is_checkout else "update", scope, new_mf.rev, len(new_mf.items))
-    conflict_str = "no conflicting local changes" if status_changelist.is_empty() else "have %s of non-conflicting local changes" % status_changelist.brief_summary()
-    if not changelist.is_empty():
+
+    if not overlap_changelist.is_empty():
+      if local_override:
+        #maintain two changelists: 1. for downloading remote changes(excludes local conflicts) 2. for updating fingerprints of all files
+        fingerprint_changelist = changelist_for_items(old_mf.items, new_mf.items) if not is_partial_checkout else Changelist()
+        for path in overlap_changelist.all_paths():
+          #do not update fingerprint in remote modify and local remove case (since it will try to update fingerprint of a file that doesn't exist)
+          if path in changelist.mod_paths and  path in status_changelist.rm_paths:
+            fingerprint_changelist.discard(path)
+          #in case of remote remove and local remove case, do not display any conflict to the user
+          if path in status_changelist.rm_paths and path in changelist.rm_paths:
+            overlap_changelist.discard(path)
+          #remove conflicting paths from change list to prevent overwrite during download
+          changelist.discard(path)
+
+        if not overlap_changelist.is_empty():
+          log.warn("local changes conflict with update for scope '%s', remote changes will be overridden by following local changes", scope)
+          log.stream.write(overlap_changelist.to_summary())
+        conflict_str = "no conflicting local changes" if overlap_changelist.is_empty() else "have %s of conflicting local changes that will not be updated" % overlap_changelist.brief_summary()
+        log.info("updating files: %s (%s)", changelist.brief_summary(), conflict_str)
+
+        #update non-conflicting changes
+        new_fingerprints = self._update_local_files(scope, new_mf.items, changelist, delete_all=True)
+        #generate fake fingerprints for conflicting files in order to pass sanity checks later
+        for path in overlap_changelist.all_paths():
+          new_fingerprints.fingerprints[path] = Fingerprint(md5=INVALID_MD5, mtime=INVALID_MTIME, size=INVALID_SIZE, state=FileState.Tracked)
+        #update fingerprints in checkout state
+        self.checkout_state.update_from_changelist(scope, fingerprint_changelist, new_fingerprints)
+      else:
+        log.error("local changes conflict with update for scope '%s':", scope)
+        log.stream.write(overlap_changelist.to_summary())
+        raise InvalidOperation("Zinc does not currently support automatic merges: must revert locally changed files, update, and then manually merge")
+    else:
+      conflict_str = "no conflicting local changes" if status_changelist.is_empty() else "have %s of non-conflicting local changes" % status_changelist.brief_summary()
       log.info("updating files: %s (%s)", changelist.brief_summary(), conflict_str)
+      # Update and delete files
+      new_fingerprints = self._update_local_files(scope, new_mf.items, changelist, delete_all=True)
+      # Changes to files are done. Update checkout state. We already have hashes in new_fingerprints.
+      self.checkout_state.update_from_changelist(scope, changelist, new_fingerprints)
 
-    # Update and delete files
-    new_fingerprints = self._update_local_files(scope, new_mf.items, changelist, delete_all=True)
-
-    # Changes to files are done. Update checkout state. We already have hashes in new_fingerprints.
-    self.checkout_state.update_from_changelist(scope, changelist, new_fingerprints)
     self.checkout_state.update_checkout_rev(scope, new_mf.rev)
     if is_partial_checkout:
       self.update_scope_mode(scope, Mode.PARTIAL)
@@ -3069,7 +3114,7 @@ class WorkingDir(object):
     # make sure this scope is in partial tracking mode first
     self.update_scope_mode(scope, Mode.PARTIAL)
     path_candidates = []
-    for local_path in self.checkout_state.fingerprints.fingerprints.iterkeys():
+    for local_path in self.checkout_state.fingerprints.fingerprints.keys():
       path = strip_prefix(scope + '/', local_path)
       if path is not None:
         path_candidates.append(path)
@@ -3220,6 +3265,7 @@ class WorkingDir(object):
   @log_calls
   def commit(self, scope, user=UNKNOWN_USER, message=EMPTY_MESSAGE, time=None, empty_ok=False, mod_all=False):
     '''Commit current changes to the repository.'''
+
     repo_tip = self.repo.get_tip(scope)
     prev_rev = self.repo.resolve_rev(scope, self.get_checkout_rev(scope))
     if prev_rev != repo_tip:
@@ -3239,7 +3285,7 @@ class WorkingDir(object):
         raise InvalidOperation("nothing to commit at scope '%s'" % scope, suppressable=True)
 
     # if a new file is tracked and simultaneously removed, raise an error (suppressable).
-    for local_path, fp in self.checkout_state.fingerprints.fingerprints.iteritems():
+    for local_path, fp in self.checkout_state.fingerprints.fingerprints.items():
       if fp.state == FileState.ToBeTracked:
         self.checkout_state._check_file_exists(local_path) # sanity check
 
@@ -3404,7 +3450,7 @@ class WorkingDir(object):
 ## Commands
 ##
 
-# Commands that work directly on the repository 
+# Commands that work directly on the repository
 _COMMAND_LIST_REPO = ["init", "newscope", "scopes", "log", "tags", "tag", "list", "copy", "locate", "_manifest"]
 # Commands that require a working directory
 _COMMAND_LIST_WORK = ["checkout", "update", "revert", "id", "ids", "status", "commit", "track", "untrack", "diff"]
@@ -3473,7 +3519,7 @@ def run_command(command, command_args, options):
       if command == "scopes":
         scopes = repo.get_scopes()
         for scope in scopes:
-          print "%s" % scope
+          print("%s" % scope)
       elif command == "log":
         require_opt(command, "scope", options)
         (start, end) = determine_rev_range(options, config)
@@ -3518,7 +3564,7 @@ def run_command(command, command_args, options):
         filter = (lambda mf: time_filter(mf.time)) if time_filter else None
         tags = repo.get_tags(options.scope, srev_start=start, srev_end=end, filter=filter)
         for (name, rev) in tags:
-          print "%s\t%s" % (name, rev)
+          print("%s\t%s" % (name, rev))
       elif command == "list":
         require_opt(command, "scope", options)
         rev = options.rev if options.rev else "tip"
@@ -3526,7 +3572,7 @@ def run_command(command, command_args, options):
         items = repo.list(options.scope, path, rev, recursive=options.recursive)
         prefix = None if options.short_paths else options.scope
         for item in items:
-          print item.display_path(prefix=prefix)
+          print(item.display_path(prefix=prefix))
       elif command == "locate":
         # TODO Rename to _locate and also include compression scheme in output.
         require_opt(command, "scope", options)
@@ -3534,7 +3580,7 @@ def run_command(command, command_args, options):
         path = command_args[0] if len(command_args) > 0 else ""
         items = repo.locate(options.scope, path, rev, recursive=options.recursive)
         for item in items:
-          print "%s\t%s" % (item[0], item[1])
+          print("%s\t%s" % (item[0], item[1]))
       elif command == "copy":
         require_opt(command, "scope", options)
         rev = options.rev if options.rev else "tip"
@@ -3545,15 +3591,15 @@ def run_command(command, command_args, options):
         require_opt(command, "scope", options)
         rev = options.rev if options.rev else "tip"
         mf = repo.get_manifest(options.scope, rev)
-        print mf.to_str()
+        print(mf.to_str())
 
   elif command in _COMMAND_LIST_WORK:
 
     # check the mode option
     if options.mode is not None:
       options.mode = options.mode.lower()
-      if options.mode not in Mode.values():
-        raise InvalidArgument("--mode has to be one of %s" % Mode.values())
+      if options.mode not in list(Mode.values()):
+        raise InvalidArgument("--mode has to be one of %s" % list(Mode.values()))
 
     # Set up a new working dir, if necessary. Do this now so we can create a WorkingDir object.
     if command == "checkout":
@@ -3589,11 +3635,11 @@ def run_command(command, command_args, options):
         rev = work.get_checkout_rev(options.scope)
         if not rev:
           raise InvalidOperation("scope '%s' is not checked out" % options.scope)
-        print "%s" % rev
+        print("%s" % rev)
       elif command == "ids":
         checkouts = work.checkouts()
         for checkout in checkouts:
-          print "%s\t%s" % (checkout.scope, checkout.rev)
+          print("%s\t%s" % (checkout.scope, checkout.rev))
       elif command == "status":
         if options.all:
           raise InvalidOperation("status --all doesn't make much sense; try status --work instead")
@@ -3627,7 +3673,7 @@ def run_command(command, command_args, options):
         rev = options.rev if options.rev else "tip"
         if not options.all and not options.work:
           require_opt(command, "scope", options)
-          work.update(options.scope, rev, force=options.force)
+          work.update(options.scope, rev, force=options.force, local_override=options.local_override)
         else:
           # For --work or --all, first update all known scopes
           if rev != "tip":
@@ -3642,7 +3688,7 @@ def run_command(command, command_args, options):
             scopes_to_checkout = [scope for scope in work.repo.get_scopes() if scope not in scopes_checked_out]
             log.info("updating %d scopes and checking out %d new scopes", len(scopes_checked_out), len(scopes_to_checkout))
           for checkout in checkouts:
-            work.update(checkout.scope, rev, force=options.force)
+            work.update(checkout.scope, rev, force=options.force, local_override=options.local_override)
           if scopes_to_checkout:
             for scope in scopes_to_checkout:
               work.checkout(scope, rev, force=options.force, mode=options.mode)
@@ -3738,16 +3784,17 @@ def main():
   parser.add_option('--utc', help='when parsing times, assume UTC if not specified', dest='assume_utc', action='store_true')
   parser.add_option('--debug', help='verbose output with debugging details', dest='debug', action='store_true')
   parser.add_option('--version', help='show version information', dest='version', action='store_true')
-  parser.add_option('--mode', help='specify tracking mode: %s (for checkout, track, untrack)' % Mode.values(), dest='mode', action='store', type='string', default=None)
+  parser.add_option('--mode', help='specify tracking mode: %s (for checkout, track, untrack)' % list(Mode.values()), dest='mode', action='store', type='string', default=None)
   parser.add_option('--no-download', help='track files without copying them to working directory (for track)', dest='no_download', action='store_true')
   parser.add_option('--full', help='show full status when in "%s" tracking mode (for status)' % Mode.PARTIAL, dest='full', action='store_true')
   parser.add_option('--minimal', help='minimal log output', dest='minimal', action='store_true')
   parser.add_option('--verbosity', help='Logging verbosity: 0 = minimal, 1 = normal, 2 = verbose, 3 = debug.', dest='verbosity', action='store', type='int', default=1)
+  parser.add_option('--local-override', help='override remote changes by local in case of a conflict', dest='local_override', action='store_true', default=False)
 
   (options, args) = parser.parse_args()
 
   if options.version:
-    print "%s" % version_str
+    print("%s" % version_str)
     sys.exit(0)
 
   if options.debug:
@@ -3770,32 +3817,32 @@ def main():
     fail("unrecognized command: run with -h for help")
 
   try:
-    run_command(command, command_args, options)  
-  except InvalidArgument, e:
+    run_command(command, command_args, options)
+  except InvalidArgument as e:
     log.debug("exception in command '%s'", command, exc_info=e)
     fail(str(e), prefix="invalid argument", exc_info=e, suppress=(options.suppress and e.suppressable))
-  except InvalidOperation, e:
+  except InvalidOperation as e:
     log.debug("exception in command '%s'", command, exc_info=e)
     fail(str(e), prefix="invalid operation", exc_info=e, suppress=(options.suppress and e.suppressable))
-  except Failure, e:
+  except Failure as e:
     log.debug("exception in command '%s'", command, exc_info=e)
     fail(str(e), prefix="error", exc_info=e, suppress=(options.suppress and e.suppressable))
-  except AssertionError, e:
+  except AssertionError as e:
     log.debug("assertion error in command '%s'", command, exc_info=e)
     fail("assertion failure: %s\nrun with --debug for details" % e.message, exc_info=e)
-  except boto.exception.S3ResponseError, e:
+  except boto.exception.S3ResponseError as e:
     log.debug("S3 error in command '%s'", command, exc_info=e)
     fail(str(e), prefix="S3 error", exc_info=e)
-  except IOError, e:
+  except IOError as e:
     log.debug("I/O error in command '%s'", command, exc_info=e)
     if e.errno == errno.EPIPE:
       fail(status=1)
     else:
       fail(str(e), status=1)
-  except KeyboardInterrupt, e:
+  except KeyboardInterrupt as e:
     log.debug("(interrupt)")
     fail(status=2)
-  except Exception, e:
+  except Exception as e:
     log.debug("exception in command '%s'", command, exc_info=e)
     fail("%s: %s" % (type(e).__name__, e), exc_info=e)
 
